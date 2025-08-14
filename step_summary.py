@@ -1,4 +1,3 @@
-# TEMPORARY workaround: set before heavy libs if you still see OpenMP conflicts.
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -20,14 +19,6 @@ from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 from langchain.docstore.document import Document
 
-# Optional image captioning imports (wrapped)
-try:
-    from transformers import pipeline
-    HAS_CAPTION = True
-except Exception:
-    HAS_CAPTION = False
-
-# ====== Load environment ======
 load_dotenv()
 API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=API_KEY)
@@ -135,35 +126,6 @@ def find_images_by_step_number(step_number, images_dir=IMAGES_DIR):
     found = sorted(list(dict.fromkeys(found)))
     return found
 
-def init_image_captioner():
-    if not HAS_CAPTION:
-        return None
-    try:
-        captioner = pipeline("image-captioning", model="Salesforce/blip-image-captioning-base")
-        return captioner
-    except Exception:
-        return None
-
-def caption_image(image_path, captioner=None):
-    """
-    Always defined. If captioner is provided, try to generate a caption.
-    If captioning fails or captioner is None, return the basename of the image.
-    """
-    if captioner:
-        try:
-            out = captioner(image_path, max_length=64, truncation=True)
-            if isinstance(out, list) and len(out) > 0:
-                # different transformers versions return different keys
-                if "caption" in out[0]:
-                    return out[0]["caption"]
-                if "generated_text" in out[0]:
-                    return out[0]["generated_text"]
-            # fallback to str representation
-        except Exception:
-            pass
-    return os.path.basename(image_path)
-
-# ====== Parse JSON: produce both ALL steps and FAILED steps ======
 def parse_log_file(json_path, images_dir=IMAGES_DIR):
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -197,18 +159,24 @@ def parse_log_file(json_path, images_dir=IMAGES_DIR):
 
     for step in steps:
         step_number = step.get("step_number", "N/A")
+        step_id = step.get("step_id", step_number)  # use step_number if no explicit id
         step_command = step.get("step_command", "") or ""
         images = []
+
+        # Collect images from step level
         for key in ("images", "image", "step_image", "step_images", "attachments"):
             if key in step:
-                 imgs = extract_image_paths(step.get(key))
-                 images.extend(imgs[:4])  # limit to first 3 images here
+                imgs = extract_image_paths(step.get(key))
+                images.extend(imgs[:4])
+
+        # Collect images from sub-step level
         for sub_step in step.get("step_logs", []):
             for key in ("images", "image", "step_image", "attachments"):
                 if key in sub_step:
                     imgs = extract_image_paths(sub_step.get(key))
-                    images.extend(imgs[:2])  # limit to first 2 images per sub-step
+                    images.extend(imgs[:2])
 
+        # Normalize image paths
         normalized = []
         for p in images:
             if not p:
@@ -223,11 +191,13 @@ def parse_log_file(json_path, images_dir=IMAGES_DIR):
                 else:
                     normalized.append(p)
         images = list(dict.fromkeys(normalized))
-        # if not images:
-            # images = find_images_by_step_number(step_number)
 
-        # build short textual context
+        # Text summary from messages
         summary_texts = []
+        retry_count = 0
+        final_error = None
+        result_overall = "SUCCESS"
+
         for sub_step in step.get("step_logs", []):
             msg = sub_step.get("message", {})
             if isinstance(msg, dict):
@@ -236,28 +206,69 @@ def parse_log_file(json_path, images_dir=IMAGES_DIR):
                     summary_texts.append(str(txt))
             elif isinstance(msg, str):
                 summary_texts.append(msg)
+
+            if sub_step.get("result") == "FAILURE":
+                retry_count += 1
+                final_error = (msg.get("llm_response") if isinstance(msg, dict) else msg) or "Unknown error"
+                result_overall = "FAILURE"
+
+            elif sub_step.get("result") == "SUCCESS" and result_overall == "FAILURE":
+                result_overall = "SUCCESS"
+
         combined_text = f"Step {step_number}: {step_command}"
         if summary_texts:
             combined_text += " | " + " ".join(summary_texts)
 
-        result_overall = "SUCCESS"
-        for sub_step in step.get("step_logs", []):
-            if sub_step.get("result") == "FAILURE":
-                result_overall = "FAILURE"
-                break
-
         entry = {
             "step_number": step_number,
+            "step_id": step_id,
             "step_command": step_command,
             "status": result_overall,
+            "retry_count": retry_count,
+            "final_error": final_error,
             "text": combined_text,
             "images": images
         }
         all_entries.append(entry)
-        if result_overall == "FAILURE":
+        if entry["status"] == "FAILURE":
             failed_entries.append(entry)
 
     return all_entries, failed_entries
+
+
+import re
+
+def find_step_by_query(query, all_entries):
+    match = re.search(r"\bstep(?:\s+number)?\s*(\d+)\b", query, re.IGNORECASE)
+    if match:
+        step_id = match.group(1)
+        for entry in all_entries:
+            if str(entry["step_id"]) == step_id or str(entry["step_number"]) == step_id:
+                return entry
+    return None
+
+
+
+# === Summary printing ===
+all_entries, failed_entries = parse_log_file(JSON_PATH, images_dir=IMAGES_DIR)
+
+# print("\n--- Step Execution Summary ---")
+for entry in all_entries:
+    step_info = f"Step {entry['step_number']} ({entry['step_command']})"
+    status_info = f"Status: {entry['status']}"
+    retry_info = f"Retries: {entry['retry_count']}"
+    error_info = f"Final error: {entry['final_error']}" if entry['final_error'] else ""
+    # print(f"{step_info} | {status_info} | {retry_info} {error_info}")
+
+if failed_entries:
+    # print("\n--- Failed Steps ---")
+    for entry in failed_entries:
+        # print(f"Step {entry['step_number']}: {entry['step_command']} "
+            f"(Retries: {entry['retry_count']}) - Error: {entry['final_error']}"
+else:
+    print("\nGood news — no steps failed in the logs!")
+
+
 
     all_entries, failed_entries = parse_log_file(JSON_PATH, images_dir=IMAGES_DIR)
     print("=== Checking images in all entries ===")
@@ -297,27 +308,6 @@ def speak_text(text):
         engine.runAndWait()
         start += max_chunk
 
-# ====== Build textual chunks (with optional captions) for display/indexing ======
-def build_entry_texts(entries, captioner=None):
-    out = []
-    for e in entries:
-        images = e.get("images", []) or []
-        captions = []
-        for img in images:
-            if os.path.exists(img) and captioner:
-                captions.append(caption_image(img, captioner))
-            else:
-                captions.append(os.path.basename(img))
-        image_section = ""
-        if images:
-            pairs = [f"{os.path.basename(p)} (caption: {c})" for p, c in zip(images, captions)]
-            image_section = "Images: " + "; ".join(pairs)
-        text = e.get("text", "")
-        if image_section:
-            text = f"{text}\n{image_section}"
-        out.append({"text": text, "images": images, "step_number": e.get("step_number"), "status": e.get("status")})
-    return out
-
 # ====== Retriever safe call (invoke or fallback) ======
 def retrieve_docs(retriever, query):
     try:
@@ -337,6 +327,53 @@ def trim_history(history, max_messages=HISTORY_MAX_MESSAGES):
     if not history:
         return history
     return history[-max_messages:]
+def ask_model_about_image(client, image_path, prompt, model="gpt-4o"):
+    """Send an image + prompt to OpenAI and return the model's text."""
+    import base64, mimetypes, os
+
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+
+    mime = mimetypes.guess_type(image_path)[0] or "image/png"
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                ]
+            }
+        ],
+        max_tokens=300
+    )
+    return response.choices[0].message.content.strip()
+
+def analyze_images_and_get_texts(image_paths, client, model="gpt-4o", prompt_extra="Please describe the image and list any readable text. Be concise."):
+    analyses = []
+    os.makedirs(OUTPUT_IMAGES_DIR, exist_ok=True)
+
+    for p in image_paths:
+        if not os.path.exists(p):
+            print(f"[WARN] Skipping missing image: {p}")
+            continue
+        try:
+            # Keep a local copy in OUTPUT_IMAGES_DIR (optional)
+            dest = os.path.join(OUTPUT_IMAGES_DIR, os.path.basename(p))
+            if os.path.abspath(p) != os.path.abspath(dest):
+                shutil.copy2(p, dest)
+
+            resp_text = ask_model_about_image(client, dest, prompt_extra, model=model)
+            print(f"Analysis for {os.path.basename(dest)}:\n{resp_text}\n")
+            analyses.append(resp_text)
+        except Exception as e:
+            print(f"Error analyzing {p}: {e}")
+            analyses.append(f"[Error analyzing {p}] {e}")
+
+    return analyses
+
 
 def ask_for_summary_of_failed(failed_entries, conversation_history=None):
     if not failed_entries:
@@ -362,17 +399,52 @@ def ask_for_summary_of_failed(failed_entries, conversation_history=None):
         print("❌ Summary generation failed:", e)
         return "Sorry, I couldn't generate the summary right now."
 
-def answer_query_with_context(query, contexts, conversation_history=None):
+
+def answer_query_with_context(query, contexts, conversation_history=None, referenced_images=None):
+    """
+    Uses text contexts (from retriever) and ONLY images referenced by the retriever
+    result metadata. Downloads/copies to OUTPUT_IMAGES_DIR, then analyzes just those.
+    """
+    # 1) Prepare image context from referenced images
+    image_context_block = ""
+    if referenced_images:
+        # Ensure local copies for URLs and relative paths
+        saved, missing = save_images_to_folder(
+            referenced_images,
+            dest_dir=OUTPUT_IMAGES_DIR,
+            images_dir=IMAGES_DIR
+        )
+        if missing:
+            print(f"[INFO] {len(missing)} image(s) missing or not downloadable. Skipping: {missing[:3]}...")
+
+        if saved:
+            try:
+                image_texts = analyze_images_and_get_texts(
+                    saved, client, model="gpt-4o",
+                    prompt_extra="Describe key UI elements and any visible status/alerts. Be concise."
+                )
+                image_context_block = "\n\n".join(
+                    [f"Image {i+1} analysis:\n{txt}" for i, txt in enumerate(image_texts)]
+                )
+            except Exception as e:
+                print(f"[WARN] Image analysis failed: {e}")
+
+    # 2) Merge textual + image context
+    combined_context = f"{contexts}\n\n{image_context_block}" if image_context_block else contexts
+
+    # 3) Build system message
     system_prompt = (
         "You are a helpful QA assistant. Answer the user's question clearly and in natural, human-friendly language. "
-        "Use the provided contexts (which may include image filenames and captions) to support your answer. "
-        "Keep it short and precise; do not include image file paths in the main answer — the program will save images separately."
-        "Avoid OCR based any information, avoid technical jargon unless necessary."
+        "Use the provided contexts (which may include image analyses) to support your answer. "
+        "Keep it short and precise; do not include image file paths in the main answer. "
+        "Avoid technical jargon unless necessary."
     )
-    messages = [{"role":"system", "content": system_prompt}]
+
+    messages = [{"role": "system", "content": system_prompt}]
     if conversation_history:
         messages.extend(trim_history(conversation_history))
-    messages.append({"role":"user", "content": f"Context:\n{contexts}\n\nUser question:\n{query}"})
+    messages.append({"role": "user", "content": f"Context:\n{combined_context}\n\nUser question:\n{query}"})
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -383,19 +455,24 @@ def answer_query_with_context(query, contexts, conversation_history=None):
     except Exception as e:
         print("❌ Answer generation failed:", e)
         return "Sorry, I couldn't answer that right now."
+    
+def collect_referenced_images(results, limit=4):
+    refs = []
+    for r in results:
+        imgs = r.metadata.get("images") if isinstance(r.metadata, dict) else None
+        if imgs:
+            for ip in imgs:
+                if ip not in refs:
+                    refs.append(ip)
+        if len(refs) >= limit:
+            break
+    return refs[:limit]
 
 # ====== Main flow ======
 if __name__ == "__main__":
     # Parse log file -> all entries and failed_entries
     all_entries, failed_entries = parse_log_file(JSON_PATH, images_dir=IMAGES_DIR)
-
-    # optional captioner (if user installed transformers)
-    captioner = init_image_captioner() if HAS_CAPTION else None
-
-    # Build presentation texts (used for indexing & display)
-    entry_dicts = build_entry_texts(all_entries, captioner=captioner)   # used for indexing ALL steps
-    failed_entry_dicts = build_entry_texts(failed_entries, captioner=captioner)  # used for summary only
-
+    
     # Build retriever over ALL steps (so queries can be about anything)
     hybrid_retriever = build_retrievers_from_all(all_entries, embeddings)
 
@@ -429,22 +506,28 @@ if __name__ == "__main__":
     elif initial_spoken and initial_spoken.strip():
         # treat initial transcript as first query
         query = initial_spoken
-        results = retrieve_docs(hybrid_retriever, query)
-        contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
-        answer = answer_query_with_context(query, contexts, conversation_history=conversation_history)
+        # Step-specific check
+        step_entry = find_step_by_query(query, all_entries)
+
+        if step_entry:
+            # Only use this step's text & images
+            contexts = step_entry["text"]
+            referenced_images = step_entry["images"]
+        else:
+            # Normal retrieval flow
+            results = retrieve_docs(hybrid_retriever, query)
+            contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
+            referenced_images = collect_referenced_images(results, limit=4)
+
+        answer = answer_query_with_context(
+            query, contexts,
+            conversation_history=conversation_history,
+            referenced_images=referenced_images
+        )
+
         print("\n--- Answer (initial) ---\n")
         print(answer)
-
-        # Simple heuristic to detect no relevant context
         
-        referenced_images = []
-        for r in results[:3]:
-            imgs = r.metadata.get("images") if isinstance(r.metadata, dict) else None
-            if imgs:
-                for ip in imgs:
-                    if ip not in referenced_images:
-                        referenced_images.append(ip)
-        referenced_images = referenced_images[:5]  # limit max 5 images
 
         if referenced_images:
             saved, missing = save_images_to_folder(referenced_images, dest_dir=OUTPUT_IMAGES_DIR, images_dir=IMAGES_DIR)
@@ -508,34 +591,29 @@ if __name__ == "__main__":
                 conversation_history.append({"role":"assistant", "content": summary})
                 continue
 
+            
             query = spoken
-            results = retrieve_docs(hybrid_retriever, query)
-            contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
-            answer = answer_query_with_context(query, contexts, conversation_history=conversation_history)
+            # Step-specific check
+            step_entry = find_step_by_query(query, all_entries)
+
+            if step_entry:
+                # Only use this step's text & images
+                contexts = step_entry["text"]
+                referenced_images = step_entry["images"]
+            else:
+                # Normal retrieval flow
+                results = retrieve_docs(hybrid_retriever, query)
+                contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
+                referenced_images = collect_referenced_images(results, limit=4)
+
+            answer = answer_query_with_context(
+                query, contexts,
+                conversation_history=conversation_history,
+                referenced_images=referenced_images
+            )
+
             print("\n--- Answer ---\n")
             print(answer)
-
-            
-            referenced_images = []
-            for r in results[:3]:
-                imgs = r.metadata.get("images") if isinstance(r.metadata, dict) else None
-                if imgs:
-                    for ip in imgs:
-                        if ip not in referenced_images:
-                            referenced_images.append(ip)
-            referenced_images = referenced_images[:5]  # limit max 5 images
-
-            if referenced_images:
-                saved, missing = save_images_to_folder(referenced_images, dest_dir=OUTPUT_IMAGES_DIR, images_dir=IMAGES_DIR)
-                print(f"\nSaved {len(saved)} images to '{OUTPUT_IMAGES_DIR}/'.")
-                if missing:
-                    print(f"{len(missing)} image(s) could not be found/downloaded:")
-                    for m in missing:
-                        print(" -", m)
-            else:
-                print("\nNo relevant images found or saved for this query.")
-
-
             speak_text(answer)
             conversation_history.append({"role":"user", "content": query})
             conversation_history.append({"role":"assistant", "content": answer})
@@ -543,27 +621,30 @@ if __name__ == "__main__":
 
         # Default: typed query
         query = cmd
-        results = retrieve_docs(hybrid_retriever, query)
-        contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
-        
+        # Step-specific check
+        step_entry = find_step_by_query(query, all_entries)
 
-        answer = answer_query_with_context(query, contexts, conversation_history=conversation_history)
+        if step_entry:
+            # Only use this step's text & images
+            contexts = step_entry["text"]
+            referenced_images = step_entry["images"]
+        else:
+            # Normal retrieval flow
+            results = retrieve_docs(hybrid_retriever, query)
+            contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
+            referenced_images = collect_referenced_images(results, limit=4)
+
+        answer = answer_query_with_context(
+            query, contexts,
+            conversation_history=conversation_history,
+            referenced_images=referenced_images
+        )
+
         print("\n--- Answer ---\n")
         print(answer)
-
-        
-        
-        referenced_images = []
-        for r in results[:3]:
-            imgs = r.metadata.get("images") if isinstance(r.metadata, dict) else None
-            if imgs:
-                for ip in imgs:
-                        if ip not in referenced_images:
-                            referenced_images.append(ip)
-            referenced_images = referenced_images[:3] 
-
-
         speak_text(answer)
         conversation_history.append({"role":"user", "content": query})
         conversation_history.append({"role":"assistant", "content": answer})
 
+
+        
