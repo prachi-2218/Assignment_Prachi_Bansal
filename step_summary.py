@@ -11,26 +11,37 @@ import numpy as np
 import tempfile
 import wave
 import glob
-from openai import OpenAI
+import logging 
+import soundfile as sf
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 from langchain.docstore.document import Document
+from openai import OpenAI
+import torch
+from pathlib import Path 
+import nltk
+nltk.download("stopwords")
+
 
 load_dotenv()
 API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=API_KEY)
-embeddings = OpenAIEmbeddings(api_key=API_KEY)
+embeddings = OpenAIEmbeddings(api_key=API_KEY) 
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # ====== Config ======
 JSON_PATH = "logs/thread_log_queue_ETqEJ_json_report.json"
-IMAGES_DIR = "executionScreens"         
+IMAGES_DIR = "executionScreens"
 OUTPUT_IMAGES_DIR = "queried_images"     # where we save images when a query references them
 DEFAULT_RECORD_DURATION = 6              # seconds (initial voice and subsequent voice queries)
 HISTORY_MAX_MESSAGES = 6                 # keep last N messages in conversation history
 RETRIEVER_K = 3                          # number of results to retrieve per retriever
+MAX_IMAGE_DOWNLOAD_BYTES = 15 * 1024 * 1024   
 
 # ====== Utilities: file-safe names and save images ======
 def safe_filename(name):
@@ -39,39 +50,58 @@ def safe_filename(name):
     return name
 
 def save_images_to_folder(image_paths, dest_dir=OUTPUT_IMAGES_DIR, images_dir=IMAGES_DIR):
+    """Downloads (or copies) a list of image paths/URLs into dest_dir.
+    Returns (saved_list, missing_list).
+    """
     os.makedirs(dest_dir, exist_ok=True)
     saved = []
     missing = []
+
     for ip in image_paths:
         ip_str = str(ip)
         try:
-            if ip_str.lower().startswith("http://") or ip_str.lower().startswith("https://"):
-                # download
+            # remote url
+            if ip_str.lower().startswith(("http://", "https://")):
                 resp = requests.get(ip_str, stream=True, timeout=15)
-                if resp.status_code == 200:
-                    fname = safe_filename(ip_str)
-                    dest_path = os.path.join(dest_dir, fname)
-                    base, ext = os.path.splitext(dest_path)
-                    counter = 1
-                    while os.path.exists(dest_path):
-                        dest_path = f"{base}_{counter}{ext}"
-                        counter += 1
-                    with open(dest_path, "wb") as f:
-                        for chunk in resp.iter_content(1024 * 8):
-                            f.write(chunk)
-                    saved.append(dest_path)
-                else:
-                    missing.append(ip_str)
+                resp.raise_for_status()
+
+                # try to detect extension
+                ext = os.path.splitext(ip_str)[1]
+                if not ext:
+                    ct = resp.headers.get("Content-Type", "")
+                    if ct:
+                        import mimetypes
+
+                        ext = mimetypes.guess_extension(ct.split(";")[0].strip()) or ".jpg"
+                    else:
+                        ext = ".jpg"
+
+                fname = safe_filename(ip_str)
+                dest_path = os.path.join(dest_dir, fname + ext)
+                base, ext2 = os.path.splitext(dest_path)
+                counter = 1
+                while os.path.exists(dest_path):
+                    dest_path = f"{base}_{counter}{ext2}"
+                    counter += 1
+
+                total = 0
+                with open(dest_path, "wb") as f:
+                    for chunk in resp.iter_content(1024 * 8):
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > MAX_IMAGE_DOWNLOAD_BYTES:
+                            raise ValueError("Download exceeds max allowed size")
+                        f.write(chunk)
+                saved.append(dest_path)
+
             else:
                 # local path attempt
-                if os.path.exists(ip_str):
+                if os.path.isabs(ip_str) and os.path.exists(ip_str):
                     src = ip_str
                 else:
                     candidate = os.path.join(images_dir, os.path.basename(ip_str))
-                    if os.path.exists(candidate):
-                        src = candidate
-                    else:
-                        src = None
+                    src = candidate if os.path.exists(candidate) else None
 
                 if src:
                     fname = safe_filename(src)
@@ -85,11 +115,14 @@ def save_images_to_folder(image_paths, dest_dir=OUTPUT_IMAGES_DIR, images_dir=IM
                     saved.append(dest_path)
                 else:
                     missing.append(ip_str)
-        except Exception:
+        except Exception as e:
+            logger.exception("Failed to save image %s: %s", ip_str, e)
             missing.append(ip_str)
+
     return saved, missing
 
-# ====== Audio recording & Whisper transcription (STT) ======
+
+# ====== Audio recording & local transcription (VOSK primary, whisper fallback) ======
 def record_audio(filename, duration=DEFAULT_RECORD_DURATION, samplerate=16000):
     print(f"🎤 Recording for {duration} sec... Speak now!")
     audio_data = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='int16')
@@ -101,17 +134,51 @@ def record_audio(filename, duration=DEFAULT_RECORD_DURATION, samplerate=16000):
         wf.writeframes(audio_data.tobytes())
     print(f"✅ Recording saved to {filename}.")
 
-def transcribe_with_whisper(filename):
+def transcribe_audio_local(audio_path: str, device: str = "cpu") -> str:
+    """
+    Transcribe audio using Silero STT (offline, PyTorch).
+    audio_path: path to WAV/FLAC audio file.
+    device: 'cpu' or 'cuda'
+    Returns the transcribed text.
+    """
+
+    # Load Silero STT model from Torch Hub
+    model, decoder, utils = torch.hub.load(
+        repo_or_dir='snakers4/silero-models',
+        model='silero_stt',
+        language='en',
+        device=device
+    )
+    (read_batch, split_into_batches, read_audio, prepare_model_input) = utils
+
+    # Read audio file
     try:
-        with open(filename, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=audio_file
-            )
-        return transcript.text.strip()
-    except Exception as e:
-        print("❌ Transcription failed:", e)
-        return ""
+        audio = read_audio(audio_path)
+    except Exception:
+        # fallback: try using soundfile
+        data, samplerate = sf.read(audio_path)
+        audio = torch.tensor(data, dtype=torch.float32)
+
+    # Prepare batches (Silero can handle longer audio in chunks)
+    batches = split_into_batches([audio], batch_size=1)
+
+    # Collect decoded text
+    texts = []
+    for batch in batches:
+        inputs = prepare_model_input(batch, device=device)
+        preds = model(inputs)
+        for pred in preds:
+            text = decoder(pred)
+            texts.append(text)
+
+    transcription = " ".join(texts).strip()
+    if transcription:
+        print("[INFO] Transcription done with Silero STT ✅")
+    else:
+        print("[WARN] No speech detected in audio.")
+
+    return transcription
+
 
 # ====== Image helpers & captioning ======
 def find_images_by_step_number(step_number, images_dir=IMAGES_DIR):
@@ -125,6 +192,7 @@ def find_images_by_step_number(step_number, images_dir=IMAGES_DIR):
         found.extend(glob.glob(p))
     found = sorted(list(dict.fromkeys(found)))
     return found
+
 
 def parse_log_file(json_path, images_dir=IMAGES_DIR):
     with open(json_path, 'r', encoding='utf-8') as f:
@@ -235,46 +303,34 @@ def parse_log_file(json_path, images_dir=IMAGES_DIR):
 
     return all_entries, failed_entries
 
-
 import re
+from word2number import w2n
 
 def find_step_by_query(query, all_entries):
+    # 1) Direct numeric digits ("step 12")
     match = re.search(r"\bstep(?:\s+number)?\s*(\d+)\b", query, re.IGNORECASE)
     if match:
         step_id = match.group(1)
         for entry in all_entries:
-            if str(entry["step_id"]) == step_id or str(entry["step_number"]) == step_id:
+            if str(entry.get("step_id")) == step_id or str(entry.get("step_number")) == step_id:
                 return entry
+
+    # 2) Number words or ordinals ("step six", "step sixth", "step twenty-one")
+    match_words = re.search(r"\bstep(?:\s+number)?\s+([a-z\-]+)\b", query, re.IGNORECASE)
+    if match_words:
+        token = match_words.group(1).lower()
+        try:
+            num = w2n.word_to_num(token)  # dynamic parsing
+            for entry in all_entries:
+                if str(entry.get("step_id")) == str(num) or str(entry.get("step_number")) == str(num):
+                    return entry
+        except ValueError:
+            pass
+
     return None
-
-
 
 # === Summary printing ===
 all_entries, failed_entries = parse_log_file(JSON_PATH, images_dir=IMAGES_DIR)
-
-# print("\n--- Step Execution Summary ---")
-for entry in all_entries:
-    step_info = f"Step {entry['step_number']} ({entry['step_command']})"
-    status_info = f"Status: {entry['status']}"
-    retry_info = f"Retries: {entry['retry_count']}"
-    error_info = f"Final error: {entry['final_error']}" if entry['final_error'] else ""
-    # print(f"{step_info} | {status_info} | {retry_info} {error_info}")
-
-if failed_entries:
-    # print("\n--- Failed Steps ---")
-    for entry in failed_entries:
-        # print(f"Step {entry['step_number']}: {entry['step_command']} "
-            f"(Retries: {entry['retry_count']}) - Error: {entry['final_error']}"
-else:
-    print("\nGood news — no steps failed in the logs!")
-
-
-
-    all_entries, failed_entries = parse_log_file(JSON_PATH, images_dir=IMAGES_DIR)
-    print("=== Checking images in all entries ===")
-    for e in all_entries:
-        print(f"Step {e['step_number']} images:", e['images'])
-
 
 # ====== Build retriever over ALL steps (so queries can be about anything) ======
 def build_retrievers_from_all(entries, embeddings_obj):
@@ -290,7 +346,27 @@ def build_retrievers_from_all(entries, embeddings_obj):
     )
     return ensemble
 
-# ====== TTS (pyttsx3) ======
+# ====== TTS improvements (single engine reused) ======
+import threading
+_tts_engine = None
+_tts_lock = threading.Lock()
+
+def init_tts_engine():
+    global _tts_engine
+    if _tts_engine is not None:
+        return _tts_engine
+    try:
+        _tts_engine = pyttsx3.init()
+        _tts_engine.setProperty("rate", 170)
+        _tts_engine.setProperty("volume", 1.0)
+        voices = _tts_engine.getProperty("voices")
+        if voices:
+            _tts_engine.setProperty("voice", voices[0].id)
+    except Exception as e:
+        logging.exception("Failed to init TTS engine: %s", e)
+        _tts_engine = None
+    return _tts_engine
+
 def speak_text(text):
     if not text or not text.strip():
         return
@@ -310,25 +386,76 @@ def speak_text(text):
 
 # ====== Retriever safe call (invoke or fallback) ======
 def retrieve_docs(retriever, query):
+    # Prefer get_relevant_documents for consistency with EnsembleRetriever
     try:
-        maybe = retriever.invoke(query)
-        if isinstance(maybe, list):
-            return maybe
-    except Exception:
-        pass
-    try:
-        return retriever.get_relevant_documents(query)
+        if hasattr(retriever, "get_relevant_documents"):
+            return retriever.get_relevant_documents(query)
+        if hasattr(retriever, "invoke"):
+            maybe = retriever.invoke(query)
+            if isinstance(maybe, list):
+                return maybe
     except Exception as e:
-        print("❌ Retriever call failed:", e)
-        return []
+        logging.exception("Retriever failed: %s", e)
+    return []
+
+
+from nltk.corpus import stopwords
+import re
+
+_stopwords = set(stopwords.words("english"))
+
+def _tokenize_and_filter(text):
+    toks = re.findall(r"[a-zA-Z0-9]+", text.lower())
+    return [t for t in toks if t not in _stopwords]
+
+def _is_result_related(result_page_content: str, query: str):
+    page_tokens = set(_tokenize_and_filter(result_page_content))
+    query_tokens = set(_tokenize_and_filter(query))
+    if not query_tokens:
+        return False
+    overlap = page_tokens.intersection(query_tokens)
+    required_overlap = max(1, len(query_tokens) // 3)  # adaptive threshold
+    return len(overlap) >= required_overlap
+
+# ====== Collect referenced images: only from results that are related to query ======
+def collect_referenced_images(results, query, limit=4):
+    refs = []
+    for r in results:
+        meta = None
+        if hasattr(r, "metadata"):
+            meta = r.metadata
+        elif isinstance(r, dict):
+            meta = r.get("metadata") or r
+        # Determine if result is related - use page_content if available
+        page_content = getattr(r, "page_content", None)
+        if page_content is None and isinstance(r, dict):
+            page_content = r.get("page_content")
+        related = _is_result_related(page_content or "", query)
+        if not related:
+            # skip images for unrelated results
+            continue
+        if isinstance(meta, dict):
+            imgs = meta.get("images") or meta.get("image") or meta.get("attachments")
+            if imgs:
+                for ip in imgs:
+                    if ip not in refs:
+                        refs.append(ip)
+        if len(refs) >= limit:
+            break
+    return refs[:limit]
 
 # ====== LLM helpers with history trimming ======
 def trim_history(history, max_messages=HISTORY_MAX_MESSAGES):
     if not history:
         return history
     return history[-max_messages:]
+
+
 def ask_model_about_image(client, image_path, prompt, model="gpt-4o"):
-    """Send an image + prompt to OpenAI and return the model's text."""
+    """Send an image + prompt to OpenAI and return the model's text.
+    Note: this function still uses the client.chat.completions.create API. If you want to avoid OpenAI entirely,
+    replace this function with a local OCR/image-analysis library.
+    """
     import base64, mimetypes, os
 
     with open(image_path, "rb") as f:
@@ -374,7 +501,6 @@ def analyze_images_and_get_texts(image_paths, client, model="gpt-4o", prompt_ext
 
     return analyses
 
-
 def ask_for_summary_of_failed(failed_entries, conversation_history=None):
     if not failed_entries:
         return "Good news — there are no failed steps in the logs."
@@ -399,81 +525,170 @@ def ask_for_summary_of_failed(failed_entries, conversation_history=None):
         print("❌ Summary generation failed:", e)
         return "Sorry, I couldn't generate the summary right now."
 
-
-def answer_query_with_context(query, contexts, conversation_history=None, referenced_images=None):
+# collect referenced images robustly
+def answer_query_with_context(
+    query,
+    contexts,
+    conversation_history=None,
+    referenced_images=None,
+    client_obj=client,
+    referenced_from_step=False
+):
     """
-    Uses text contexts (from retriever) and ONLY images referenced by the retriever
-    result metadata. Downloads/copies to OUTPUT_IMAGES_DIR, then analyzes just those.
+    Answer a user query using provided textual contexts and optional referenced images.
+    - If referenced_from_step is True, images passed in referenced_images are considered authoritative and will be saved/analyzed.
+    - If referenced_from_step is False, images will only be saved/analyzed if there is textual context related to the query.
     """
     # 1) Prepare image context from referenced images
     image_context_block = ""
     if referenced_images:
-        # Ensure local copies for URLs and relative paths
-        saved, missing = save_images_to_folder(
-            referenced_images,
-            dest_dir=OUTPUT_IMAGES_DIR,
-            images_dir=IMAGES_DIR
-        )
-        if missing:
-            print(f"[INFO] {len(missing)} image(s) missing or not downloadable. Skipping: {missing[:3]}...")
+        # Only proceed to save/analyze images if either this was explicitly a step-based query
+        # or the provided textual contexts are related to the query according to our heuristic.
+        proceed_with_images = bool(referenced_from_step) or _is_result_related(contexts or "", query)
+        if not proceed_with_images:
+            logger.info("Images present but no textual context related to query; skipping saving/analyzing images.")
+            # Do not save or analyze images if there's no context related to the query
+            referenced_images = None
+        else:
+            # Ensure local copies for URLs and relative paths
+            saved, missing = save_images_to_folder(
+                referenced_images,
+                dest_dir=OUTPUT_IMAGES_DIR,
+                images_dir=IMAGES_DIR
+            )
+            if missing:
+                logger.info(
+                    "%d image(s) missing or not downloadable. Skipping: %s",
+                    len(missing), missing[:3]
+                )
 
-        if saved:
-            try:
-                image_texts = analyze_images_and_get_texts(
-                    saved, client, model="gpt-4o",
-                    prompt_extra="Describe key UI elements and any visible status/alerts. Be concise."
-                )
-                image_context_block = "\n\n".join(
-                    [f"Image {i+1} analysis:\n{txt}" for i, txt in enumerate(image_texts)]
-                )
-            except Exception as e:
-                print(f"[WARN] Image analysis failed: {e}")
+            if saved and client_obj:
+                try:
+                    image_texts = analyze_images_and_get_texts(
+                        saved,
+                        client_obj,
+                        model="gpt-4o",
+                        prompt_extra="Describe key UI elements and any visible status/alerts. Be concise."
+                    )
+                    image_context_block = "\n\n".join(
+                        [f"Image {i+1} analysis:\n{txt}" for i, txt in enumerate(image_texts)]
+                    )
+                except Exception as e:
+                    logger.exception("Image analysis failed: %s", e)
+                    # Fall back to a brief note that images couldn't be analyzed
+                    image_context_block = "[Image analysis failed or unavailable.]"
+            elif saved and not client_obj:
+                # We have image files but no LLM client to analyze them
+                image_context_block = "[Images are available but no LLM client configured to analyze them.]"
 
     # 2) Merge textual + image context
-    combined_context = f"{contexts}\n\n{image_context_block}" if image_context_block else contexts
+    combined_context = (
+        f"{contexts}\n\n{image_context_block}"
+        if image_context_block else contexts
+    )
 
     # 3) Build system message
     system_prompt = (
-        "You are a helpful QA assistant. Answer the user's question clearly and in natural, human-friendly language. "
+        "You are a helpful QA assistant. Answer the user's question clearly and in natural, human-friendly,non-technical language. "
         "Use the provided contexts (which may include image analyses) to support your answer. "
         "Keep it short and precise; do not include image file paths in the main answer. "
-        "Avoid technical jargon unless necessary."
+        "Avoid technical jargon unless necessary.Give answer in the form of paragraph"
+        "If the answer cannot be inferred from the provided context, respond with "
+        "'I don't have enough information from the context to answer.'"
     )
 
     messages = [{"role": "system", "content": system_prompt}]
     if conversation_history:
         messages.extend(trim_history(conversation_history))
-    messages.append({"role": "user", "content": f"Context:\n{combined_context}\n\nUser question:\n{query}"})
+    messages.append({
+        "role": "user",
+        "content": f"Context:\n{combined_context}\n\nUser question:\n{query}"
+    })
 
+    # 4) If no client is configured, return a fallback summary of the contexts
+    if not client_obj:
+        fallback = (
+            "No LLM client configured to generate an answer. Here is the combined context I could find:\n\n"
+        )
+        # Truncate large context to keep fallback manageable
+        fallback += combined_context[:4000] + (
+            "...\n\n(Context truncated)" if len(combined_context) > 4000 else ""
+        )
+        return fallback
+
+    # 5) Call the model
     try:
-        response = client.chat.completions.create(
+        response = client_obj.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             max_tokens=600
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print("❌ Answer generation failed:", e)
-        return "Sorry, I couldn't answer that right now."
-    
+        logger.exception("Answer generation failed: %s", e)
+        return (
+            "Sorry, I couldn't generate an answer right now. You can try again or ask a simpler question.\n\n"
+            "Relevant context:\n" +
+            combined_context[:3000] +
+            ("...\n(Context truncated)" if len(combined_context) > 3000 else "")
+        )
+
+
 def collect_referenced_images(results, limit=4):
+    # Deprecated signature kept for backward compatibility; prefers the query-aware function below
+    return []
+
+# new query-aware helper is used in main logic
+
+def collect_referenced_images_for_query(results, query, limit=4):
+    return collect_referenced_images(results, query, limit)
+
+
+# collect_referenced_images with query awareness (implemented above as collect_referenced_images)
+# But to avoid name conflicts in the rest of the script, we'll provide a wrapper that uses the function defined earlier.
+
+def collect_referenced_images(results, query_or_limit=None, limit=None):
+    # This wrapper is to maintain backward compatibility if called with (results, limit)
+    # Expected normal call: collect_referenced_images(results, query, limit=4)
+    if limit is None:
+        # Called as collect_referenced_images(results, query, limit)
+        query = query_or_limit if isinstance(query_or_limit, str) else ""
+        max_limit = 8
+    else:
+        query = query_or_limit
+        max_limit = limit
+
     refs = []
     for r in results:
-        imgs = r.metadata.get("images") if isinstance(r.metadata, dict) else None
-        if imgs:
-            for ip in imgs:
-                if ip not in refs:
-                    refs.append(ip)
-        if len(refs) >= limit:
+        meta = None
+        if hasattr(r, "metadata"):
+            meta = r.metadata
+        elif isinstance(r, dict):
+            meta = r.get("metadata") or r
+        page_content = getattr(r, "page_content", None)
+        if page_content is None and isinstance(r, dict):
+            page_content = r.get("page_content")
+        related = _is_result_related(page_content or "", query)
+        if not related:
+            continue
+        if isinstance(meta, dict):
+            imgs = meta.get("images") or meta.get("image") or meta.get("attachments")
+            if imgs:
+                for ip in imgs:
+                    if ip not in refs:
+                        refs.append(ip)
+        if len(refs) >= max_limit:
             break
-    return refs[:limit]
+    return refs[:max_limit]
 
 # ====== Main flow ======
 if __name__ == "__main__":
     # Parse log file -> all entries and failed_entries
     all_entries, failed_entries = parse_log_file(JSON_PATH, images_dir=IMAGES_DIR)
-    
+
     # Build retriever over ALL steps (so queries can be about anything)
+    if embeddings is None:
+        raise RuntimeError("OpenAI embeddings not configured. Set OPENAI_API_KEY in .env if you want embeddings.")
     hybrid_retriever = build_retrievers_from_all(all_entries, embeddings)
 
     conversation_history = []
@@ -484,7 +699,7 @@ if __name__ == "__main__":
         start_wav = tmp.name
     try:
         record_audio(start_wav, duration=DEFAULT_RECORD_DURATION)
-        initial_spoken = transcribe_with_whisper(start_wav)
+        initial_spoken = transcribe_audio_local(start_wav)
     finally:
         try:
             os.remove(start_wav)
@@ -517,20 +732,20 @@ if __name__ == "__main__":
             # Normal retrieval flow
             results = retrieve_docs(hybrid_retriever, query)
             contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
-            referenced_images = collect_referenced_images(results, limit=4)
+            referenced_images = collect_referenced_images(results, query, limit=4)
 
         answer = answer_query_with_context(
             query, contexts,
             conversation_history=conversation_history,
-            referenced_images=referenced_images
+            referenced_images=referenced_images,
+            referenced_from_step=bool(step_entry)
         )
 
         print("\n--- Answer (initial) ---\n")
         print(answer)
-        
 
         if referenced_images:
-            saved, missing = save_images_to_folder(referenced_images, dest_dir=OUTPUT_IMAGES_DIR, images_dir=IMAGES_DIR)
+            saved, missing = ([], [])  # saving handled in answer_query_with_context (or skipped when unrelated)
             print(f"\nSaved {len(saved)} images to '{OUTPUT_IMAGES_DIR}/'.")
             if missing:
                 print(f"{len(missing)} image(s) could not be found/downloaded:")
@@ -538,7 +753,6 @@ if __name__ == "__main__":
                     print(" -", m)
         else:
             print("\nNo relevant images found or saved for this query.")
-
 
         speak_text(answer)
         conversation_history.append({"role":"user", "content": query})
@@ -570,7 +784,7 @@ if __name__ == "__main__":
                 wav_path = tmp.name
             try:
                 record_audio(wav_path, duration=DEFAULT_RECORD_DURATION)
-                spoken = transcribe_with_whisper(wav_path)
+                spoken = transcribe_audio_local(wav_path)
             finally:
                 try:
                     os.remove(wav_path)
@@ -591,7 +805,6 @@ if __name__ == "__main__":
                 conversation_history.append({"role":"assistant", "content": summary})
                 continue
 
-            
             query = spoken
             # Step-specific check
             step_entry = find_step_by_query(query, all_entries)
@@ -604,13 +817,14 @@ if __name__ == "__main__":
                 # Normal retrieval flow
                 results = retrieve_docs(hybrid_retriever, query)
                 contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
-                referenced_images = collect_referenced_images(results, limit=4)
-
+                referenced_images = collect_referenced_images(results, query, limit=4)
+            
             answer = answer_query_with_context(
-                query, contexts,
-                conversation_history=conversation_history,
-                referenced_images=referenced_images
-            )
+            query, contexts,
+            conversation_history=conversation_history,
+            referenced_images=referenced_images,
+            referenced_from_step=bool(step_entry)
+        )
 
             print("\n--- Answer ---\n")
             print(answer)
@@ -632,19 +846,17 @@ if __name__ == "__main__":
             # Normal retrieval flow
             results = retrieve_docs(hybrid_retriever, query)
             contexts = "\n\n".join([r.page_content for r in results]) if results else "No relevant context found."
-            referenced_images = collect_referenced_images(results, limit=4)
+            referenced_images = collect_referenced_images(results, query, limit=4)
 
         answer = answer_query_with_context(
             query, contexts,
             conversation_history=conversation_history,
-            referenced_images=referenced_images
+            referenced_images=referenced_images,
+            referenced_from_step=bool(step_entry)
         )
 
-        print("\n--- Answer ---\n")
+        print("\n--- Answer (initial) ---\n")
         print(answer)
         speak_text(answer)
         conversation_history.append({"role":"user", "content": query})
         conversation_history.append({"role":"assistant", "content": answer})
-
-
-        
