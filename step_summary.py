@@ -22,9 +22,23 @@ from langchain.docstore.document import Document
 from openai import OpenAI
 import torch
 from pathlib import Path 
+# Ensure stopwords are available without forcing a download at import time
 import nltk
-nltk.download("stopwords")
-
+try:
+    from nltk.corpus import stopwords
+    _stopwords = set(stopwords.words("english"))
+except Exception:
+    # If not present, attempt to download once and then import
+    try:
+        nltk.download("stopwords")
+        from nltk.corpus import stopwords
+        _stopwords = set(stopwords.words("english"))
+    except Exception:
+        # Fallback: minimal stopword set to avoid crashes
+        _stopwords = {
+            "the","is","in","on","and","a","an","of","to","for","was","were",
+            "did","do","does","what","when","how","why","step","steps","show","shows"
+        }
 
 load_dotenv()
 API_KEY = os.getenv("OPENAI_API_KEY")
@@ -328,9 +342,6 @@ def find_step_by_query(query, all_entries):
             pass
 
     return None
-
-# === Summary printing ===
-all_entries, failed_entries = parse_log_file(JSON_PATH, images_dir=IMAGES_DIR)
 
 # ====== Build retriever over ALL steps (so queries can be about anything) ======
 def build_retrievers_from_all(entries, embeddings_obj):
